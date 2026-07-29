@@ -1,18 +1,14 @@
 import logging
-import os
 from typing import Literal
 
 from pydantic import AliasChoices, Field, model_validator
-from pydantic_settings import BaseSettings
+
+from optexity.utils.llm_settings import LLMSettings
 
 logger = logging.getLogger(__name__)
 
-env_path = os.getenv("ENV_PATH")
-if not env_path:
-    logger.warning("ENV_PATH is not set, using default values")
 
-
-class Settings(BaseSettings):
+class Settings(LLMSettings):
     SERVER_URL: str = "https://api.optexity.com"
     HEALTH_ENDPOINT: str = "api/v1/health"
     INFERENCE_ENDPOINT: str = "api/v1/inference"
@@ -70,9 +66,7 @@ class Settings(BaseSettings):
                 self.PROXY_COUNTRY = "US"
         return self
 
-    class Config:
-        env_file = env_path if env_path else None
-        extra = "allow"
+    # Config (env_file / extra) is inherited from LLMSettings.
 
 
 settings = Settings()  # pyright: ignore[reportCallIssue]
