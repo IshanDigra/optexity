@@ -246,13 +246,67 @@ class ActionNode(BaseModel):
 
 
 class ForLoopNode(BaseModel):
-    # Loops through range of values of {variable_name[<index_variable_name>]}
+    # Loops through list values ({variable_name}) or page matches ({locator}).
+    # Exactly one of variable_name / locator must be set. Field descriptions are
+    # consumed by the workflow authoring agent via TypeAdapter(...).json_schema(),
+    # so keep them accurate.
     type: Literal["for_loop_node"]
-    variable_name: str
-    # Placeholder name used in {var[<name>]} / bare {<name>}. Defaults to
-    # "index" for backward compatibility. Use distinct names when nesting loops
-    # so the outer index remains addressable inside the inner loop.
-    index_variable_name: str = "index"
+    variable_name: str | None = Field(
+        default=None,
+        description=(
+            "Name of the list variable to iterate over; its length is the "
+            "iteration count. Comma-separated names iterate in parallel, with "
+            "the first one setting the length. Reference values in the loop "
+            "body as {variable_name[<index_variable_name>]}. Mutually "
+            "exclusive with locator: exactly one of the two must be set."
+        ),
+    )
+    locator: str | None = Field(
+        default=None,
+        description=(
+            "Playwright locator command evaluated against `page` (same grammar "
+            "as assert_locator_node.locator), e.g. 'get_by_role(\"row\")'. The "
+            "number of matched elements is the iteration count, so use this to "
+            "loop over rows/items whose count is not known when authoring. "
+            "Reference the current match in the loop body as "
+            "{locator[<index_variable_name>]}, which expands to "
+            "<locator>.nth(<N>) and can be chained: "
+            "'{locator[row]}.locator(\"td.NameCell\")'. Mutually exclusive "
+            "with variable_name: exactly one of the two must be set."
+        ),
+    )
+    index_variable_name: str = Field(
+        default="index",
+        description=(
+            "Placeholder name bound to the current iteration's number, used as "
+            "{var[<name>]} / {locator[<name>]} and bare {<name>}. Defaults to "
+            '"index" for backward compatibility. Use distinct names when '
+            "nesting loops so the outer index remains addressable inside the "
+            "inner loop. Must not be 'index_of', must not be 'locator' in "
+            "locator mode, and must not match a name listed in variable_name."
+        ),
+    )
+    locator_timeout: float = Field(
+        default=5.0,
+        description=(
+            "Locator loops only: seconds to wait for the first match to attach "
+            "before counting (Playwright's count() does not auto-wait, so "
+            "without this a table that renders asynchronously counts as empty "
+            "and the loop body never runs). After the first match, the runtime "
+            "also waits until the match count stays unchanged for 1s so rows "
+            "that stream in shortly after the first paint are included. A "
+            "locator that never attaches yields zero iterations (with a "
+            "warning) rather than an error, so an empty result table is "
+            "handled without failing the run."
+        ),
+    )
+    max_iterations: int | None = Field(
+        default=None,
+        description=(
+            "Cap on the number of iterations; extra items are skipped with a "
+            "warning. Null means iterate over everything the source provides."
+        ),
+    )
     nodes: list[
         Annotated[
             ActionNode | IfElseNodeRef | ForLoopNodeRef | AssertLocatorNodeRef,
@@ -268,7 +322,25 @@ class ForLoopNode(BaseModel):
     on_error_in_loop: Literal["continue", "break", "raise"] = "raise"
 
     @model_validator(mode="after")
-    def validate_index_variable_name(self):
+    def validate_loop_source_and_index(self):
+        # Normalize blanks so schema and runtime agree (whitespace ≠ a source).
+        if self.variable_name is not None:
+            stripped = self.variable_name.strip()
+            self.variable_name = stripped or None
+        if self.locator is not None:
+            stripped = self.locator.strip()
+            self.locator = stripped or None
+
+        has_variable = self.variable_name is not None
+        has_locator = self.locator is not None
+        if has_variable == has_locator:
+            raise ValueError("Exactly one of variable_name or locator must be provided")
+
+        if self.locator_timeout < 0:
+            raise ValueError("locator_timeout must not be negative")
+        if self.max_iterations is not None and self.max_iterations <= 0:
+            raise ValueError("max_iterations must be greater than 0")
+
         name = self.index_variable_name
         if not name or not name.isidentifier():
             raise ValueError(
@@ -279,14 +351,22 @@ class ForLoopNode(BaseModel):
                 "index_variable_name cannot be 'index_of' (reserved for "
                 "{index_of(variable)} placeholders)"
             )
-        loop_vars = {
-            part.strip() for part in self.variable_name.split(",") if part.strip()
-        }
-        if name in loop_vars:
+        if has_locator and name == "locator":
             raise ValueError(
-                f"index_variable_name {name!r} must not match a name in "
-                f"variable_name {self.variable_name!r}"
+                "index_variable_name cannot be 'locator' in locator mode; "
+                "use a distinct name (e.g. 'row') with {locator[row]} for the "
+                "current match and {row} for the numeric index"
             )
+        if has_variable:
+            assert self.variable_name is not None
+            loop_vars = {
+                part.strip() for part in self.variable_name.split(",") if part.strip()
+            }
+            if name in loop_vars:
+                raise ValueError(
+                    f"index_variable_name {name!r} must not match a name in "
+                    f"variable_name {self.variable_name!r}"
+                )
         return self
 
     def replace(self, pattern: str, replacement: str | int | float | bool | None):
@@ -296,6 +376,9 @@ class ForLoopNode(BaseModel):
         the runtime expects a `.replace()` method (e.g. loop expansion).
         """
         replacement_str = "" if replacement is None else str(replacement)
+
+        if self.locator is not None:
+            self.locator = self.locator.replace(pattern, replacement_str)
 
         for node in self.nodes:
             if hasattr(node, "replace"):
@@ -344,6 +427,16 @@ class ForLoopNode(BaseModel):
 
                 if isinstance(item, dict) and "locator" in item and "assertion" in item:
                     new_nodes.append({"type": "assert_locator_node", **item})
+                    continue
+
+                if (
+                    isinstance(item, dict)
+                    and "locator" in item
+                    and "nodes" in item
+                    and "assertion" not in item
+                    and "variable_name" not in item
+                ):
+                    new_nodes.append({"type": "for_loop_node", **item})
                     continue
 
                 new_nodes.append({"type": "action_node", **item})
@@ -418,6 +511,16 @@ class IfElseNode(BaseModel):
 
                 if isinstance(item, dict) and "locator" in item and "assertion" in item:
                     new_nodes.append({"type": "assert_locator_node", **item})
+                    continue
+
+                if (
+                    isinstance(item, dict)
+                    and "locator" in item
+                    and "nodes" in item
+                    and "assertion" not in item
+                    and "variable_name" not in item
+                ):
+                    new_nodes.append({"type": "for_loop_node", **item})
                     continue
 
                 new_nodes.append({"type": "action_node", **item})
@@ -545,6 +648,16 @@ class Automation(BaseModel):
 
             if isinstance(item, dict) and "locator" in item and "assertion" in item:
                 new_nodes.append({"type": "assert_locator_node", **item})
+                continue
+
+            if (
+                isinstance(item, dict)
+                and "locator" in item
+                and "nodes" in item
+                and "assertion" not in item
+                and "variable_name" not in item
+            ):
+                new_nodes.append({"type": "for_loop_node", **item})
                 continue
 
             new_nodes.append({"type": "action_node", **item})

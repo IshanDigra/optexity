@@ -13,6 +13,9 @@ from patchright._impl._errors import TimeoutError as PatchrightTimeoutError
 from patchright.async_api import expect as playwright_expect
 from playwright._impl._errors import TimeoutError as PlaywrightTimeoutError
 
+from optexity.inference.core.for_loop_placeholders import (
+    expand_iteration_placeholders,
+)
 from optexity.inference.core.interaction.handle_captcha import handle_captcha_action
 from optexity.inference.core.interaction.utils import (
     _wait_for_file_stable,
@@ -514,37 +517,6 @@ async def handle_if_else_node(
     memory.update_system_info()
 
 
-def _expand_for_loop_placeholders(
-    node,
-    variable_names: list[str],
-    index: int,
-    index_variable_name: str,
-):
-    """Bind loop placeholders for one iteration onto a deep-copied node.
-
-    Replacement order matters:
-    1. ``{var[<index_variable_name>]}`` → ``{var[<N>]}``
-    2. ``{index_of(primary)}`` → ``<N>``
-    3. bare ``{<index_variable_name>}`` → ``<N>`` (last, so it cannot
-       corrupt ``index_of(...)`` or ``{var[...]}`` patterns)
-    """
-    for variable_name in variable_names:
-        try:
-            node.replace(
-                f"{{{variable_name}[{index_variable_name}]}}",
-                f"{{{variable_name}[{index}]}}",
-            )
-        except Exception as e:
-            logger.error(
-                f"Error replacing variable {variable_name} in for loop node: {e}"
-            )
-            continue
-
-    node.replace(f"{{index_of({variable_names[0]})}}", f"{index}")
-    node.replace(f"{{{index_variable_name}}}", f"{index}")
-    return node
-
-
 async def _run_for_loop_child_node(
     node,
     memory: Memory,
@@ -564,6 +536,85 @@ async def _run_for_loop_child_node(
         await run_action_node(node, task, memory, browser)
 
 
+# After the first match attaches, require the match count to stay unchanged
+# for this long so slowly streaming tables are not under-counted.
+_LOCATOR_COUNT_STABLE_SECONDS = 1.0
+_LOCATOR_COUNT_POLL_INTERVAL = 0.1
+# Safety bound if the page keeps adding matches forever (e.g. infinite scroll).
+_LOCATOR_COUNT_STABLE_MAX_WAIT = 30.0
+
+
+async def _wait_for_stable_locator_count(locator) -> int:
+    """Poll ``count()`` until it is unchanged for ``_LOCATOR_COUNT_STABLE_SECONDS``."""
+    last_count = await locator.count()
+    stable_since = time.monotonic()
+    deadline = time.monotonic() + _LOCATOR_COUNT_STABLE_MAX_WAIT
+    while True:
+        now = time.monotonic()
+        if now - stable_since >= _LOCATOR_COUNT_STABLE_SECONDS:
+            return last_count
+        if now >= deadline:
+            logger.warning(
+                f"Locator match count did not stay stable for "
+                f"{_LOCATOR_COUNT_STABLE_SECONDS}s within "
+                f"{_LOCATOR_COUNT_STABLE_MAX_WAIT}s; using count={last_count}"
+            )
+            return last_count
+        await asyncio.sleep(_LOCATOR_COUNT_POLL_INTERVAL)
+        current = await locator.count()
+        if current != last_count:
+            last_count = current
+            stable_since = time.monotonic()
+
+
+async def _count_locator_matches(for_loop_node: ForLoopNode, browser: Browser) -> int:
+    """Number of elements a locator loop should iterate over.
+
+    Playwright's ``count()`` does not auto-wait, so give the first match a chance
+    to attach first: results tables are usually rendered a moment after the
+    action that triggers them, and sleep_for_page_to_load returns immediately
+    once the page has loaded. Counting straight away would see zero rows and
+    silently skip the whole loop body.
+
+    After the first match attaches, the count must stay unchanged for
+    ``_LOCATOR_COUNT_STABLE_SECONDS`` so rows that stream in shortly after the
+    first paint are included. A locator that resolves but never attaches means
+    zero rows, which is a legitimate outcome (empty result table) rather than
+    an error.
+    """
+    assert for_loop_node.locator is not None
+    locator = await browser.get_locator_from_command(for_loop_node.locator)
+    if locator is None:
+        # Only happens when the browser/page itself is gone, not when the
+        # selector matches nothing, so surface it instead of looping zero times.
+        raise ValueError(
+            f"Could not resolve locator {for_loop_node.locator!r} for for_loop_node"
+        )
+
+    if for_loop_node.locator_timeout > 0:
+        try:
+            await locator.first.wait_for(
+                state="attached", timeout=for_loop_node.locator_timeout * 1000
+            )
+        except (TimeoutError, PatchrightTimeoutError, PlaywrightTimeoutError):
+            logger.warning(
+                f"No matching locator found: {for_loop_node.locator!r} "
+                f"(waited {for_loop_node.locator_timeout}s); "
+                f"for loop will run zero iterations"
+            )
+            return 0
+    elif await locator.count() == 0:
+        logger.warning(
+            f"No matching locator found: {for_loop_node.locator!r}; "
+            f"for loop will run zero iterations"
+        )
+        return 0
+
+    count = await _wait_for_stable_locator_count(locator)
+    logger.debug(f"Locator {for_loop_node.locator!r} matched {count} element(s)")
+    return count
+
+
 async def handle_for_loop_node(
     for_loop_node: ForLoopNode,
     memory: Memory,
@@ -572,46 +623,85 @@ async def handle_for_loop_node(
     full_automation: list[ActionNode],
 ):
     memory.update_system_info()
-    primary_variable = for_loop_node.variable_name.split(",")[0].strip()
-    if primary_variable in task.input_parameters:
-        values = task.input_parameters[primary_variable]
-    elif primary_variable in memory.variables.generated_variables:
-        values = memory.variables.generated_variables[primary_variable]
-    else:
-        raise ValueError(
-            f"Variable name {primary_variable} not found in input variables or generated variables"
-        )
-    variable_names = [name.strip() for name in for_loop_node.variable_name.split(",")]
     index_variable_name = for_loop_node.index_variable_name
     memory.variables.for_loop_status.append([])
-    for index in range(len(values)):
 
+    locator_command: str | None = None
+    variable_names: list[str] | None = None
+
+    # Schema normalizes blanks to None; use is not None so branch matches XOR.
+    if for_loop_node.locator is not None:
+        locator_command = for_loop_node.locator
+        # Snapshot match count once at loop start (stable index set for .nth).
+        # Apply max_iterations before building the values list so a huge match
+        # set cannot allocate thousands of strings before the cap bites.
+        count = await _count_locator_matches(for_loop_node, browser)
+        if (
+            for_loop_node.max_iterations is not None
+            and count > for_loop_node.max_iterations
+        ):
+            logger.warning(
+                f"For loop source {locator_command} has {count} items but "
+                f"max_iterations is {for_loop_node.max_iterations}; skipping the "
+                f"remaining {count - for_loop_node.max_iterations} item(s)"
+            )
+            count = for_loop_node.max_iterations
+        values: list[str | int | float | bool] = [
+            f"{locator_command}.nth(" + str(i) + ")" for i in range(count)
+        ]
+        status_name = locator_command
+    else:
+        assert for_loop_node.variable_name is not None
+        primary_variable = for_loop_node.variable_name.split(",")[0].strip()
+        if primary_variable in task.input_parameters:
+            values = task.input_parameters[primary_variable]
+        elif primary_variable in memory.variables.generated_variables:
+            values = memory.variables.generated_variables[primary_variable]
+        else:
+            raise ValueError(
+                f"Variable name {primary_variable} not found in input variables or generated variables"
+            )
+        variable_names = [
+            name.strip() for name in for_loop_node.variable_name.split(",")
+        ]
+        status_name = for_loop_node.variable_name
+        if (
+            for_loop_node.max_iterations is not None
+            and len(values) > for_loop_node.max_iterations
+        ):
+            logger.warning(
+                f"For loop source {status_name} has {len(values)} items but "
+                f"max_iterations is {for_loop_node.max_iterations}; skipping the "
+                f"remaining {len(values) - for_loop_node.max_iterations} item(s)"
+            )
+            values = values[: for_loop_node.max_iterations]
+
+    for index in range(len(values)):
         try:
             for node in for_loop_node.nodes:
-                new_node = _expand_for_loop_placeholders(
+                new_node = expand_iteration_placeholders(
                     deepcopy(node),
-                    variable_names,
                     index,
                     index_variable_name,
+                    variable_names=variable_names,
+                    locator_command=locator_command,
                 )
                 await _run_for_loop_child_node(
                     new_node, memory, task, browser, full_automation
                 )
             memory.variables.for_loop_status[-1].append(
                 ForLoopStatus(
-                    variable_name=for_loop_node.variable_name,
+                    variable_name=status_name,
                     index=index,
                     value=values[index],
                     status="success",
                 )
             )
         except Exception as e:
-            logger.error(
-                f"Error running for loop node {for_loop_node.variable_name}: {e}"
-            )
+            logger.error(f"Error running for loop node {status_name}: {e}")
             memory.variables.for_loop_status[-1].append(
                 ForLoopStatus(
-                    variable_name=for_loop_node.variable_name,
+                    variable_name=status_name,
                     index=index,
                     value=values[index],
                     status="error",
@@ -624,7 +714,7 @@ async def handle_for_loop_node(
                 for index2 in range(index + 1, len(values)):
                     memory.variables.for_loop_status[-1].append(
                         ForLoopStatus(
-                            variable_name=for_loop_node.variable_name,
+                            variable_name=status_name,
                             index=index2,
                             value=values[index2],
                             status="skipped",
@@ -639,11 +729,12 @@ async def handle_for_loop_node(
             for node in for_loop_node.reset_nodes:
                 # Reset nodes also get the current iteration's placeholders
                 # bound so they can reference the item that just finished.
-                new_node = _expand_for_loop_placeholders(
+                new_node = expand_iteration_placeholders(
                     deepcopy(node),
-                    variable_names,
                     index,
                     index_variable_name,
+                    variable_names=variable_names,
+                    locator_command=locator_command,
                 )
                 await _run_for_loop_child_node(
                     new_node, memory, task, browser, full_automation
