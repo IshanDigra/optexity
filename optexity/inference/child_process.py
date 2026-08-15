@@ -399,7 +399,23 @@ async def task_processor():
                 headers={"x-api-key": task.api_key},
                 log_label=f"automation fetch for task {task.task_id}",
             )
-            if response is not None:
+            if os.path.exists("test_automation_cached.json"):
+                with open("test_automation_cached.json") as f:
+                    data = json.load(f)
+                    task.automation = Automation.model_validate(data)
+                fetch_success = True
+                logger.info(
+                    f"Overrode automation with test_automation_cached.json for task {task.task_id}"
+                )
+            elif os.path.exists("test_automation.json"):
+                with open("test_automation.json") as f:
+                    data = json.load(f)
+                    task.automation = Automation.model_validate(data)
+                fetch_success = True
+                logger.info(
+                    f"Overrode automation with test_automation.json for task {task.task_id}"
+                )
+            elif response is not None:
                 try:
                     data = response.json()
                     task.automation = Automation.model_validate(data["automation"])
