@@ -18,7 +18,7 @@ This work spans two repos:
 | [02_design_decisions_and_tradeoffs.md](02_design_decisions_and_tradeoffs.md) | Every non-obvious choice, the alternative rejected, and why |
 | [03_trial_run_results.md](03_trial_run_results.md) | The evidence — real caches, generated automations, measured numbers, honest caveats |
 | [04_future_production_considerations.md](04_future_production_considerations.md) | What this is not yet: there is no cache *lookup* step. What production needs |
-| [05_setup_guide_feedback.md](05_setup_guide_feedback.md) | Four setup blockers that fail silently, with suggested wording for the brief |
+| [05_setup_guide_feedback.md](05_setup_guide_feedback.md) | Setup notes: two things that fail silently, worth adding to the brief |
 
 ## Try it
 
