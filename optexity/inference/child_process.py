@@ -433,6 +433,42 @@ async def task_processor():
                         f"Failed to parse automation response for task "
                         f"{task.task_id}: {parse_err}"
                     )
+            # --- LOCAL DEVELOPMENT OVERRIDE ---
+            # Automations normally live in Optexity's database. This loads one from disk instead so
+            # it can be iterated on locally. Set OPTEXITY_LOCAL_AUTOMATION to choose which file -
+            # that is what makes it possible to run the agentic baseline and the cached automation
+            # back to back without renaming files between runs.
+            local_automation_path = os.environ.get(
+                "OPTEXITY_LOCAL_AUTOMATION", "test_automation.json"
+            )
+            if os.path.exists(local_automation_path):
+                try:
+                    with open(local_automation_path) as f:
+                        task.automation = Automation.model_validate(json.load(f))
+
+                    # Drop any parameters the local automation does not declare, otherwise
+                    # variable substitution in worker.py fails on the unexpected keys.
+                    expected_inputs = task.automation.parameters.input_parameters.keys()
+                    task.input_parameters = {
+                        k: v for k, v in task.input_parameters.items() if k in expected_inputs
+                    }
+                    expected_secures = task.automation.parameters.secure_parameters.keys()
+                    task.secure_parameters = {
+                        k: v for k, v in task.secure_parameters.items() if k in expected_secures
+                    }
+
+                    fetch_success = True
+                    logger.info(
+                        f"Overrode automation with {local_automation_path} "
+                        f"for task {task.task_id}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to load local automation override "
+                        f"{local_automation_path}: {e}"
+                    )
+            # --- END LOCAL DEVELOPMENT OVERRIDE ---
+
             if not fetch_success:
                 if task.automation is not None:
                     logger.warning(

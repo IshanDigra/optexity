@@ -14,6 +14,18 @@ from optexity.schema.task import Task
 
 logger = logging.getLogger(__name__)
 
+# Actions whose effect cannot be expressed as a deterministic Optexity interaction action.
+#
+# `evaluate` runs arbitrary JavaScript. An agent that reaches for it can change page state without
+# ever touching an element, so the run leaves no locator behind to replay - the work becomes
+# invisible to anything reconstructing the workflow from what the agent did. Excluding it forces the
+# agent to use real clicks and typing, which do convert.
+#
+# Note `screenshot` is deliberately NOT excluded: agentic_task defaults to use_vision=False, so
+# taking a screenshot is often how the agent orients itself. It is observation rather than action,
+# so it costs a little latency but nothing downstream.
+NON_REPLAYABLE_TOOLS = ["evaluate"]
+
 
 async def handle_agentic_task(
     agentic_task_action: AgenticTask | CloseOverlayPopupAction,
@@ -46,7 +58,7 @@ async def handle_agentic_task(
                 ]
             )
         else:
-            tools = Tools()
+            tools = Tools(exclude_actions=NON_REPLAYABLE_TOOLS)
         llm = build_agent_llm(normalize_model(task.llm_provider, task.llm_model_name))
         browser_session = BrowserSession(
             cdp_url=browser.cdp_url, keep_alive=agentic_task_action.keep_alive
