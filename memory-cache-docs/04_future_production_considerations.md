@@ -156,5 +156,5 @@ Stated plainly, because they are the first things a reviewer should ask about:
 - **No iterative re-caching loop.** The second bonus — cache, rebuild, re-run, re-cache — is not
   built. §4's promotion gate plus §5's staleness invalidation is that loop as a standing service
   rather than a one-shot script, and is the right shape for it.
-- **`.first` can mask ambiguity.** Accepted deliberately (see design decisions §5);
+- **`.first` can mask ambiguity.** Accepted deliberately (see [design decisions](02_design_decisions_and_tradeoffs.md), "The rest");
   `inspect_cache` surfaces duplicate locators at build time so it is visible before replay.
