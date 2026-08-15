@@ -433,6 +433,27 @@ async def task_processor():
                         f"Failed to parse automation response for task "
                         f"{task.task_id}: {parse_err}"
                     )
+
+            # --- START OF YOUR LOCAL TESTING ADDITION ---
+            import os
+            if os.path.exists("test_automation_cached.json"):
+                with open("test_automation_cached.json") as f:
+                    data = json.load(f)
+                    task.automation = Automation.model_validate(data)
+                fetch_success = True
+                logger.info(
+                    f"Overrode automation with test_automation_cached.json for task {task.task_id}"
+                )
+            elif os.path.exists("test_automation.json"):
+                with open("test_automation.json") as f:
+                    data = json.load(f)
+                    task.automation = Automation.model_validate(data)
+                fetch_success = True
+                logger.info(
+                    f"Overrode automation with test_automation.json for task {task.task_id}"
+                )
+            # --- END OF YOUR LOCAL TESTING ADDITION ---
+
             if not fetch_success:
                 if task.automation is not None:
                     logger.warning(
