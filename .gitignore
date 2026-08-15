@@ -216,3 +216,10 @@ node_modules
 optexity/utils/optexity.code-workspace
 
 tmp
+# --- memory-cache layer: local run artifacts and secrets ---
+# Kept on disk for iteration, never committed.
+.env.bak
+cache*.jsonl
+test_automation*.json
+Assignment/
+codebase.md
